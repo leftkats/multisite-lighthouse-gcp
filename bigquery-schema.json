@@ -10,6 +10,11 @@
     "type": "STRING"
   },
   {
+    "description": "Execution ID",
+    "name": "execution_id",
+    "type": "STRING"
+  },
+  {
     "description": "Site ID and Pub/Sub trigger message.",
     "name": "site_id",
     "type": "STRING"
@@ -18,6 +23,12 @@
     "description": "User-Agent string of the browser that did the audit.",
     "name": "user_agent",
     "type": "STRING"
+  },
+  {
+    "description": "Blocked urls.",
+    "name": "blocked_urls",
+    "type": "STRING",
+    "mode": "REPEATED"
   },
   {
     "description": "The BigQuery Job ID of the load.",

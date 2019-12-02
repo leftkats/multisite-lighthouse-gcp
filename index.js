@@ -29,6 +29,7 @@ const puppeteer = require(`puppeteer`);
 const lighthouse = require(`lighthouse`);
 const uuidv1 = require(`uuid/v1`);
 const {Validator} = require(`jsonschema`);
+const requestGet = promisify(require('request').get)
 
 const {BigQuery} = require(`@google-cloud/bigquery`);
 const {PubSub} = require(`@google-cloud/pubsub`);
@@ -57,6 +58,10 @@ const validator = new Validator;
 
 const log = console.log;
 
+const separator = '_';
+const thirdPartyBlocked = '3PBlocked';
+const thirdPartyIncluded = '3PIncluded';
+
 /**
  * Function that runs lighthouse in a headless browser instance.
  *
@@ -64,7 +69,7 @@ const log = console.log;
  * @param {string} url URL to audit.
  * @returns {Promise<object>} The object containing the lighthouse report.
  */
-async function launchBrowserWithLighthouse(id, url) {
+async function launchBrowserWithLighthouse(id, url, lighthouseFlags) {
 
   log(`${id}: Starting browser for ${url}`);
 
@@ -72,21 +77,27 @@ async function launchBrowserWithLighthouse(id, url) {
 
   log(`${id}: Browser started for ${url}`);
 
-  config.lighthouseFlags = config.lighthouseFlags || {};
+  lighthouseFlags = lighthouseFlags || {};
 
-  config.lighthouseFlags.port = (new URL(browser.wsEndpoint())).port;
+  lighthouseFlags.port = (new URL(browser.wsEndpoint())).port;
 
-  log(`${id}: Starting lighthouse for ${url}`);
+  async function launch() {
+    const lhr = await lighthouse(url, lighthouseFlags);
+    log(`${id}: Lighthouse done for ${url}`);
+    return lhr;
+  }
 
-  const lhr = await lighthouse(url, config.lighthouseFlags);
-
-  log(`${id}: Lighthouse done for ${url}`);
-
-  await browser.close();
-
-  log(`${id}: Browser closed for ${url}`);
-
-  return lhr;
+  try {
+    log(`${id}: Starting lighthouse for ${url}`);
+    log(lighthouseFlags);
+    return await launch();
+  } catch (e) {
+    log(`${id}: Retrying lighthouse for ${url}`);
+    return await launch();
+  } finally {
+    await browser.close();
+    log(`${id}: Browser closed for ${url}`);
+  }
 }
 
 /**
@@ -103,6 +114,7 @@ function createJSON(obj, id) {
     site_id: id,
     user_agent: obj.userAgent,
     emulated_as: obj.configSettings.emulatedFormFactor,
+    blocked_urls: obj.configSettings.blockedUrlPatterns || [],
     accessibility: [{
       total_score: obj.categories.accessibility.score,
       bypass_repetitive_content: obj.audits.bypass.score === 1,
@@ -202,6 +214,16 @@ function toNdjson(data) {
   return outNdjson;
 }
 
+async function sendToPubsub(msg) {
+  log(`Pubsub sending message: ${msg}`);
+  const buffer = Buffer.from(msg);
+  await pubsub
+    .topic(process.env.PUBSUB_TOPIC || config.pubsubTopicId)
+    .publisher()
+    .publish(buffer);
+  log(`Pubsub sent: ${msg}`);
+}
+
 /**
  * Publishes a message to the Pub/Sub topic for every ID in config.json source object.
  *
@@ -209,14 +231,15 @@ function toNdjson(data) {
  * @returns {Promise<any[]>} Resolved promise when all IDs have been published.
  */
 async function sendAllPubsubMsgs(ids) {
+  const executionId = uuidv1();
   return await Promise.all(ids.map(async (id) => {
-    const msg = Buffer.from(id);
-    log(`${id}: Sending init PubSub message`);
-    await pubsub
-      .topic(config.pubsubTopicId)
-      .publisher()
-      .publish(msg);
-    log(`${id}: Init PubSub message sent`)
+    log(`Processing: ${id}`)
+    await sendToPubsub(`${id}${separator}${thirdPartyIncluded}${separator}mobile${separator}${executionId}`);
+    await sendToPubsub(`${id}${separator}${thirdPartyIncluded}${separator}desktop${separator}${executionId}`);
+    if (process.env.THIRDPARTY_TO_BLOCK) {
+      await sendToPubsub(`${id}${separator}${thirdPartyBlocked}${separator}mobile${separator}${executionId}`);
+      await sendToPubsub(`${id}${separator}${thirdPartyBlocked}${separator}desktop${separator}${executionId}`);
+    }
   }));
 }
 
@@ -228,7 +251,8 @@ async function sendAllPubsubMsgs(ids) {
  * @returns {Promise<void>} Resolved promise when all write operations are complete.
  */
 async function writeLogAndReportsToStorage(obj, id) {
-  const bucket = storage.bucket(config.gcs.bucketName);
+  const bucketName = process.env.BUCKET_NAME || config.gcs.bucketName;
+  const bucket = storage.bucket(bucketName);
   config.lighthouseFlags.output = config.lighthouseFlags.output || [];
   await Promise.all(config.lighthouseFlags.output.map(async (fileType, idx) => {
     let filePath = `${id}/report_${obj.lhr.fetchTime}`;
@@ -247,13 +271,13 @@ async function writeLogAndReportsToStorage(obj, id) {
         mimetype = 'text/html';
     }
     const file = bucket.file(filePath);
-    log(`${id}: Writing ${fileType} report to bucket ${config.gcs.bucketName}`);
+    log(`${id}: Writing ${fileType} report to bucket ${bucketName}`);
     return await file.save(obj.report[idx], {
       metadata: {contentType: mimetype}
     });
   }));
   const file = bucket.file(`${id}/log_${obj.lhr.fetchTime}.json`);
-  log(`${id}: Writing log to bucket ${config.gcs.bucketName}`);
+  log(`${id}: Writing log to bucket ${bucketName}`);
   return await file.save(JSON.stringify(obj.lhr, null, " "), {
     metadata: {contentType: 'application/json'}
   });
@@ -268,12 +292,13 @@ async function writeLogAndReportsToStorage(obj, id) {
  * @returns {Promise<object>} Object describing active state and time delta between invocation and when the state entry was created, if necessary.
  */
 async function checkEventState(id, timeNow) {
+  const bucketName = process.env.BUCKET_NAME || config.gcs.bucketName;
   let eventStates = {};
   try {
     // Try to load existing state file from storage
     const destination = `/tmp/state_${id}.json`;
     await storage
-      .bucket(config.gcs.bucketName)
+      .bucket(bucketName)
       .file(`${id}/state.json`)
       .download({destination: destination});
     eventStates = JSON.parse(await readFile(destination));
@@ -287,7 +312,7 @@ async function checkEventState(id, timeNow) {
 
   // Otherwise write the state of the event with current timestamp and save to bucket
   eventStates[id] = {created: timeNow};
-  await storage.bucket(config.gcs.bucketName).file(`${id}/state.json`).save(JSON.stringify(eventStates, null, " "), {
+  await storage.bucket(bucketName).file(`${id}/state.json`).save(JSON.stringify(eventStates, null, " "), {
     metadata: {contentType: 'application/json'}
   });
   return {active: false}
@@ -303,52 +328,127 @@ async function checkEventState(id, timeNow) {
 async function launchLighthouse (event, callback) {
   try {
 
-    const source = config.source;
-    const msg = Buffer.from(event.data, 'base64').toString();
-    const ids = source.map(obj => obj.id);
-    const uuid = uuidv1();
-    const metadata = {
-      sourceFormat: 'NEWLINE_DELIMITED_JSON',
-      schema: {fields: bqSchema},
-      jobId: uuid
-    };
+    let source = config.source;
+    const sourceUrl = process.env.SOURCE_URL;
+    const sourceAuth = process.env.SOURCE_AUTH;
+    if (sourceUrl) {
 
-    // If the Pub/Sub message is not valid
-    if (msg !== 'all' && !ids.includes(msg)) { return console.error('No valid message found!'); }
-
-    if (msg === 'all') { return sendAllPubsubMsgs(ids); }
-
-    const [src] = source.filter(obj => obj.id === msg);
-    const id = src.id;
-    const url = src.url;
-
-    log(`${id}: Received message to start with URL ${url}`);
-
-    const timeNow = new Date().getTime();
-    const eventState = await checkEventState(id, timeNow);
-    if (eventState.active) {
-      return log(`${id}: Found active event (${Math.round(eventState.delta)}s < ${Math.round(config.minTimeBetweenTriggers/1000)}s), aborting...`);
+      const headers = { };
+      if (sourceAuth) {
+        headers.Authorization = sourceAuth;
+      }
+      const externalSource = await requestGet({uri: sourceUrl, headers: headers});
+      source = flatContentfulJson(externalSource)
+      if (process.env.EXTRA_URLS) {
+        const extras = process.env.EXTRA_URLS.split(',').map(extraUrl => {
+          const extraUrlParts = extraUrl.split('::');
+          if (extraUrlParts[0] && extraUrlParts[1]) {
+            return {
+              'id': extraUrlParts[0],
+              'url': extraUrlParts[1]
+            }
+          }
+        }).filter(Boolean)
+        source.push(...extras);
+      }
     }
 
-    const res = await launchBrowserWithLighthouse(id, url);
+    const msg = "Buffer.from(event.data, 'base64').toString()";
+    const msgParts = msg.split(separator);
+    const idMsg = msgParts[0];
+    const lighthouseFlags = {...config.lighthouseFlags};
+    if (msgParts[1] === thirdPartyBlocked) {
+      lighthouseFlags.blockedUrlPatterns = process.env.THIRDPARTY_TO_BLOCK.split(',');
+    }
+    if (msgParts[2]) {
+      lighthouseFlags.emulatedFormFactor = msgParts[2];
+    }
 
-    await writeLogAndReportsToStorage(res, id);
+    const ids = source.map(obj => obj.id);
+    const uuid = uuidv1();
+    // const metadata = {
+    //   sourceFormat: 'NEWLINE_DELIMITED_JSON',
+    //   schema: {fields: bqSchema},
+    //   jobId: uuid
+    // };
+
+    // If the Pub/Sub message is not valid
+    if (idMsg !== 'all' && !ids.includes(idMsg)) { return console.error('No valid message found!'); }
+
+    if (idMsg === 'all') {
+      return sendAllPubsubMsgs(ids);
+    }
+
+    const [src] = source.filter(obj => obj.id === idMsg);
+    const id = src.id;
+    const url = src.url;
+    const executionId = msgParts[3] || 'no_execution_id';
+
+    log(`${msg}: Received message to start with URL ${url}, third party ${msgParts[1]}, mode ${msgParts[2]}, executionId: ${executionId}`);
+
+    const timeNow = new Date().getTime();
+    const eventState = await checkEventState(msg, timeNow);
+    if (eventState.active) {
+      return log(`${msg}: Found active event (${Math.round(eventState.delta)}s < ${Math.round(config.minTimeBetweenTriggers/1000)}s), aborting...`);
+    }
+
+    const res = await launchBrowserWithLighthouse(id, url, lighthouseFlags);
+
+    await writeLogAndReportsToStorage(res, msg);
     const json = createJSON(res.lhr, id);
 
     json.job_id = uuid;
+    json.execution_id = executionId;
 
-    await writeFile(`/tmp/${uuid}.json`, toNdjson(json));
+    // await writeFile(`/tmp/${uuid}.json`, toNdjson(json));
 
-    log(`${id}: BigQuery job with ID ${uuid} starting for ${url}`);
+    log(`${id}: BigQuery job with ID ${uuid} starting for ${url}`);;
 
-    return bigquery
-      .dataset(config.datasetId)
+
+    const dataset = bigquery.dataset(process.env.DATASET_ID || config.datasetId);
+    const tableExists = await dataset.table('reports').exists();
+    if (!tableExists[0]) {
+      const options = {
+        schema: bqSchema
+      };
+      await dataset
+      .createTable('reports', options);
+    }
+
+    try {
+      await dataset
       .table('reports')
-      .load(`/tmp/${uuid}.json`, metadata);
+      .insert({id: uuid, json: json}, {raw: true});
+
+      log(`${id}: BigQuery job with ID ${uuid} finished  for ${url}`);
+    } catch(err) {
+      log('Error on insert of bigquery')
+      log(JSON.stringify(err))
+    }
 
   } catch(e) {
     console.error(e);
   }
+}
+
+function flatContentfulJson(json) {
+  const fields = JSON.parse(json.body).fields;
+  const sections = ['help', 'fmcTariffs', 'mobileTariffs', 'mobilePhones', 'fixedTariffs', 'prepaidTariffs', 'other', 'bussiness', 'privateZone', 'fullWeb'];
+  const sourceArray = [];
+  sections.forEach(section => {
+    if (fields.json[section]) {
+      sourceArray.push({url: fields.json[section]['url'], id: fields.json[section]['name']})
+      fields.json[section]['list'].forEach(entry => {
+          sourceArray.push({url: entry.url, id: entry.name})
+          if (entry.list) {
+            entry.list.forEach(subEntry => {
+              sourceArray.push({url: subEntry.url, id: subEntry.name})
+            })
+        }
+      })
+    }
+  })
+  return sourceArray;
 }
 
 /**
