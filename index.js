@@ -72,8 +72,13 @@ const thirdPartyIncluded = '3PIncluded';
 async function launchBrowserWithLighthouse(id, url, lighthouseFlags) {
 
   log(`${id}: Starting browser for ${url}`);
-
-  const browser = await puppeteer.launch({args: ['--no-sandbox']});
+  try {
+    const browser = await puppeteer.launch({args: ['--no-sandbox']});
+  }
+  catch(e) {
+    console.error(e);
+    log(`Failed to launch puppeteer`);
+  }
 
   log(`${id}: Browser started for ${url}`);
 
@@ -82,8 +87,15 @@ async function launchBrowserWithLighthouse(id, url, lighthouseFlags) {
   lighthouseFlags.port = (new URL(browser.wsEndpoint())).port;
 
   async function launch() {
-    const lhr = await lighthouse(url, lighthouseFlags);
-    log(`${id}: Lighthouse done for ${url}`);
+    try
+    {
+      const lhr = await lighthouse(url, lighthouseFlags);
+      log(`${id}: Lighthouse done for ${url}`);
+    }
+    catch(e) {
+      console.error(e);
+      log(`Failed to start lighthouse`);
+    }
     return lhr;
   }
 
@@ -217,11 +229,18 @@ function toNdjson(data) {
 async function sendToPubsub(msg) {
   log(`Pubsub sending message: ${msg}`);
   const buffer = Buffer.from(msg);
-  await pubsub
-    .topic(process.env.PUBSUB_TOPIC || config.pubsubTopicId)
-    .publisher()
-    .publish(buffer);
-  log(`Pubsub sent: ${msg}`);
+  try {
+    await pubsub
+      .topic(process.env.PUBSUB_TOPIC || config.pubsubTopicId)
+      .publisher()
+      .publish(buffer);
+    log(`Pubsub sent: ${msg}`);
+  }
+  catch(e) {
+    console.error(e);
+    log(`Failed to sent Pubsub msg: ${msg}`);
+  }
+
 }
 
 /**
@@ -302,7 +321,9 @@ async function checkEventState(id, timeNow) {
       .file(`${id}/state.json`)
       .download({destination: destination});
     eventStates = JSON.parse(await readFile(destination));
-  } catch(e) {}
+  } catch(e) {
+    console.error(e);
+  }
 
   // Check if event corresponding to id has been triggered less than the timeout ago
   const delta = id in eventStates && (timeNow - eventStates[id].created);
@@ -326,7 +347,6 @@ async function checkEventState(id, timeNow) {
  * @returns {Promise<*>} Promise when BigQuery load starts.
  */
 async function launchLighthouse (event, callback) {
-  try {
 
     let source = config.source;
     const sourceUrl = process.env.SOURCE_URL;
@@ -337,7 +357,13 @@ async function launchLighthouse (event, callback) {
       if (sourceAuth) {
         headers.Authorization = sourceAuth;
       }
-      const externalSource = await requestGet({uri: sourceUrl, headers: headers});
+      try {
+        const externalSource = await requestGet({uri: sourceUrl, headers: headers});
+      }
+      catch(e) {
+        console.error(e);
+        log(`Request GET`);
+      }
       source = flatContentfulJson(externalSource)
       if (process.env.EXTRA_URLS) {
         const extras = process.env.EXTRA_URLS.split(',').map(extraUrl => {
@@ -387,14 +413,38 @@ async function launchLighthouse (event, callback) {
     log(`${msg}: Received message to start with URL ${url}, third party ${msgParts[1]}, mode ${msgParts[2]}, executionId: ${executionId}`);
 
     const timeNow = new Date().getTime();
+
+    try
+    {
     const eventState = await checkEventState(msg, timeNow);
+    }
+    catch(e) {
+      console.error(e);
+      log(`Failed to check eventsState`);
+    }
+
+
     if (eventState.active) {
       return log(`${msg}: Found active event (${Math.round(eventState.delta)}s < ${Math.round(config.minTimeBetweenTriggers/1000)}s), aborting...`);
     }
+    try
+    {
+      const res = await launchBrowserWithLighthouse(id, url, lighthouseFlags);
+    }
+    catch(e) {
+      console.error(e);
+      log(`Configuration validated successfully`);
+    }
 
-    const res = await launchBrowserWithLighthouse(id, url, lighthouseFlags);
+    try
+    {
+      await writeLogAndReportsToStorage(res, msg);
+    }
+    catch(e) {
+      console.error(e);
+      log(`Configuration validated successfully`);
+    }
 
-    await writeLogAndReportsToStorage(res, msg);
     const json = createJSON(res.lhr, id);
 
     json.job_id = uuid;
@@ -406,13 +456,28 @@ async function launchLighthouse (event, callback) {
 
 
     const dataset = bigquery.dataset(process.env.DATASET_ID || config.datasetId);
-    const tableExists = await dataset.table('reports').exists();
+    try
+    {
+      const tableExists = await dataset.table('reports').exists();
+    }
+    catch(e) {
+      console.error(e);
+      log(`Failed to check if table exists`);
+    }
+
     if (!tableExists[0]) {
       const options = {
         schema: bqSchema
       };
-      await dataset
-      .createTable('reports', options);
+      try
+      {
+        await dataset
+        .createTable('reports', options);
+      }
+      catch(e) {
+        console.error(e);
+        log(`Failed to create table`);
+      }
     }
 
     try {
@@ -426,9 +491,6 @@ async function launchLighthouse (event, callback) {
       log(JSON.stringify(err))
     }
 
-  } catch(e) {
-    console.error(e);
-  }
 }
 
 function flatContentfulJson(json) {
